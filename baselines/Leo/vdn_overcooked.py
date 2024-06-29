@@ -1,45 +1,27 @@
-"""
-End-to-End JAX Implementation of VDN.
-
-Notice:
-- Agents are controlled by a single RNN architecture.
-- You can choose if sharing parameters between agents or not.
-- Works also with non-homogenous agents (different obs/action spaces)
-- Experience replay is a simple buffer with uniform sampling.
-- Uses Double Q-Learning with a target agent network (hard-updated).
-- You can use TD Loss (pymarl2) or DDQN loss (pymarl)
-- Adam optimizer is used instead of RMSPROP.
-- The environment is reset at the end of each episode.
-- Trained with a team reward (reward['__all__'])
-- At the moment, last_actions are not included in the agents' observations.
-
-The implementation closely follows the original Pymarl: https://github.com/oxwhirl/pymarl/blob/master/src/learners/q_learner.py
+""" 
+Based on PureJaxRL Implementation of PPO
 """
 
-import os
 import jax
 import jax.numpy as jnp
+import flax.linen as nn
 import numpy as np
 from functools import partial
-from typing import NamedTuple, Dict, Union
-
 import chex
-
 import optax
-import flax.linen as nn
 from flax.linen.initializers import constant, orthogonal
+from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import flashbax as fbx
-import wandb
+import distrax
+from gymnax.wrappers.purerl import LogWrapper, FlattenObservationWrapper
+import jaxmarl
+from jaxmarl.wrappers.baselines import LogWrapper, CTRolloutManager
+from jaxmarl.environments.overcooked import overcooked_layouts
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 import hydra
 from omegaconf import OmegaConf
-from safetensors.flax import save_file
-from flax.traverse_util import flatten_dict
 
-from jaxmarl import make
-from jaxmarl.wrappers.baselines import LogWrapper, SMAXLogWrapper, CTRolloutManager
-from jaxmarl.environments.smax import map_name_to_scenario
-from jaxmarl.environments.overcooked import overcooked_layouts
 import matplotlib.pyplot as plt
 
 class ScannedRNN(nn.Module):
@@ -122,50 +104,121 @@ class EpsilonGreedy:
         keys = dict(zip(q_vals.keys(), jax.random.split(rng, len(q_vals)))) # get a key for each agent
         chosen_actions = jax.tree_util.tree_map(lambda q, k: explore(q, eps, k), q_vals, keys)
         return chosen_actions
+    action_dim: Sequence[int]
+    activation: str = "tanh"
 
+    @nn.compact
+    def __call__(self, x):
+        if self.activation == "relu":
+            activation = nn.relu
+        else:
+            activation = nn.tanh
+        actor_mean = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(x)
+        actor_mean = activation(actor_mean)
+        actor_mean = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(actor_mean)
+        actor_mean = activation(actor_mean)
+        actor_mean = nn.Dense(
+            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
+        )(actor_mean)
+        pi = distrax.Categorical(logits=actor_mean)
+
+        critic = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(x)
+        critic = activation(critic)
+        critic = nn.Dense(
+            64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+        )(critic)
+        critic = activation(critic)
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+            critic
+        )
+
+        return pi, jnp.squeeze(critic, axis=-1)
+    
 class Transition(NamedTuple):
     obs: dict
     actions: dict
     rewards: dict
     dones: dict
     infos: dict
-    
-def plot_rewards(metrics, filename, num_seeds):
-    test_metrics = metrics["test_metrics"]
-    test_returns = test_metrics["test_returns"].mean(-1).reshape((num_seeds, -1))
 
-    reward_mean = test_returns.mean(0)  # mean
-    reward_std = test_returns.std(0) / np.sqrt(num_seeds)  # standard error
-    
-    plt.plot(reward_mean)
-    plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
-    plt.xlabel("Update Step")
-    plt.ylabel("Return")
-    plt.savefig(f'{filename}.png')
+def get_rollout(train_state, config):
+    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    env = LogWrapper(env)
+    key = jax.random.PRNGKey(0)
+    key, key_r, key_a = jax.random.split(key, 3)
+
+    # Initialize the environment and the network
+    obs, env_state = env.reset(key_r)
+    done = False
+
+    state_seq = [(obs, env_state)]
+
+    hidden_state = ScannedRNN.initialize_carry(config['alg']['AGENT_HIDDEN_DIM'], len(env.agents))
+
+    while not done:
+        key, key_a = jax.random.split(key, 2)
+
+        # Flatten observations
+        obs = {k: v.flatten() for k, v in obs.items()}
+        
+        # Add a dummy time-step dimension to the agent input
+        obs_ = {a: obs[a][np.newaxis, :] for a in env.agents}
+        dones_ = {a: jnp.zeros((1, 1)) for a in env.agents}  # Ensure 2D shape for each agent
+
+        # Prepare batched input
+        agents, flatten_agents_obs = zip(*obs_.items())
+        batched_input = (
+            jnp.concatenate(flatten_agents_obs, axis=1),  # (time_step, n_agents*n_envs, obs_size)
+            jnp.concatenate([dones_[agent] for agent in agents], axis=1),  # Ensure 2D shape
+        )
+
+        # Get q-values from the agent network
+        hidden_state, q_vals = train_state.apply_fn({'params': train_state.params['params']}, hidden_state, batched_input)
+        
+        actions = {agent: jnp.argmax(q_vals[agent].squeeze(), axis=-1) for agent in env.agents}
+
+        # Step the environment
+        obs, env_state, rewards, dones, infos = env.step(key_a, env_state, actions)
+        done = dones['__all__']
+        
+        state_seq.append((obs, env_state, hidden_state))
+
+    return state_seq
 
 
-def make_train(config, env):
 
+def make_train(config):
+    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"] 
     )
     
-    def train(rng):
+    env = CTRolloutManager((LogWrapper(env)), batch_size=config["NUM_ENVS"])
+    
+    def linear_schedule(count):
+        frac = 1.0 - (count / config["NUM_UPDATES"])
+        return config["LR"] * frac
 
+    def train(rng):
+        
         # INIT ENV
         rng, _rng = jax.random.split(rng)
-        wrapped_env = CTRolloutManager(env, batch_size=config["NUM_ENVS"])
-        test_env = CTRolloutManager(env, batch_size=config["NUM_TEST_EPISODES"]) # batched env for testing (has different batch size)
-        init_obs, env_state = wrapped_env.batch_reset(_rng)
-        init_dones = {agent:jnp.zeros((config["NUM_ENVS"]), dtype=bool) for agent in env.agents+['__all__']}
-
+        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        
         # INIT BUFFER
         # to initalize the buffer is necessary to sample a trajectory to know its strucutre
         def _env_sample_step(env_state, unused):
             rng, key_a, key_s = jax.random.split(jax.random.PRNGKey(0), 3) # use a dummy rng here
             key_a = jax.random.split(key_a, env.num_agents)
-            actions = {agent: wrapped_env.batch_sample(key_a[i], agent) for i, agent in enumerate(env.agents)}
-            obs, env_state, rewards, dones, infos = wrapped_env.batch_step(key_s, env_state, actions)
+            actions = {agent: env.batch_sample(key_a[i], agent) for i, agent in enumerate(env.agents)}
+            obs, env_state, rewards, dones, infos = env.batch_step(key_s, env_state, actions)
             transition = Transition(obs, actions, rewards, dones, infos)
             return env_state, transition
         _, sample_traj = jax.lax.scan(
@@ -183,18 +236,18 @@ def make_train(config, env):
         buffer_state = buffer.init(sample_traj_unbatched) 
 
         # INIT NETWORK
-        agent = AgentRNN(action_dim=wrapped_env.max_action_space, hidden_dim=config["AGENT_HIDDEN_DIM"], init_scale=config['AGENT_INIT_SCALE'])
+        agent = AgentRNN(action_dim=env.max_action_space, hidden_dim=config["AGENT_HIDDEN_DIM"], init_scale=config['AGENT_INIT_SCALE'])
         rng, _rng = jax.random.split(rng)
         if config.get('PARAMETERS_SHARING', True):
             init_x = (
-                jnp.zeros((1, 1, wrapped_env.obs_size)), # (time_step, batch_size, obs_size)
+                jnp.zeros((1, 1, env.obs_size)), # (time_step, batch_size, obs_size)
                 jnp.zeros((1, 1)) # (time_step, batch size)
             )
             init_hs = ScannedRNN.initialize_carry(config['AGENT_HIDDEN_DIM'], 1) # (batch_size, hidden_dim)
             network_params = agent.init(_rng, init_hs, init_x)
         else:
             init_x = (
-                jnp.zeros((len(env.agents), 1, 1, wrapped_env.obs_size)), # (time_step, batch_size, obs_size)
+                jnp.zeros((len(env.agents), 1, 1, env.obs_size)), # (time_step, batch_size, obs_size)
                 jnp.zeros((len(env.agents), 1, 1)) # (time_step, batch size)
             )
             init_hs = ScannedRNN.initialize_carry(config['AGENT_HIDDEN_DIM'], len(env.agents),  1) # (n_agents, batch_size, hidden_dim)
@@ -202,9 +255,6 @@ def make_train(config, env):
             network_params = jax.vmap(agent.init, in_axes=(0, 0, 0))(rngs, init_hs, init_x)
 
         # INIT TRAIN STATE AND OPTIMIZER
-        def linear_schedule(count):
-            frac = 1.0 - (count / config["NUM_UPDATES"])
-            return config["LR"] * frac
         lr = linear_schedule if config.get('LR_LINEAR_DECAY', False) else config['LR']
         tx = optax.chain(
             optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -217,8 +267,7 @@ def make_train(config, env):
         )
         # target network params
         target_agent_params = jax.tree_util.tree_map(lambda x: jnp.copy(x), train_state.params)
-
-        # INIT EXPLORATION STRATEGY
+        
         explorer = EpsilonGreedy(
             start_e=config["EPSILON_START"],
             end_e=config["EPSILON_FINISH"],
@@ -251,8 +300,8 @@ def make_train(config, env):
                 hidden_state, q_vals = jax.vmap(agent.apply, in_axes=0)(params, hidden_state, batched_input)
                 q_vals = {a:q_vals[i] for i,a in enumerate(agents)}
                 return hidden_state, q_vals
-
-        # TRAINING LOOP
+        
+        # TRAIN LOOP
         def _update_step(runner_state, unused):
 
             train_state, target_agent_params, env_state, buffer_state, time_state, init_obs, init_dones, test_metrics, rng = runner_state
@@ -273,12 +322,12 @@ def make_train(config, env):
                 # get the q_values from the agent netwoek
                 hstate, q_vals = homogeneous_pass(params, hstate, obs_, dones_)
                 # remove the dummy time_step dimension and index qs by the valid actions of each agent 
-                valid_q_vals = jax.tree_util.tree_map(lambda q, valid_idx: q.squeeze(0)[..., valid_idx], q_vals, wrapped_env.valid_actions)
+                valid_q_vals = jax.tree_util.tree_map(lambda q, valid_idx: q.squeeze(0)[..., valid_idx], q_vals, env.valid_actions)
                 # explore with epsilon greedy_exploration
                 actions = explorer.choose_actions(valid_q_vals, t, key_a)
 
                 # STEP ENV
-                obs, env_state, rewards, dones, infos = wrapped_env.batch_step(key_s, env_state, actions)
+                obs, env_state, rewards, dones, infos = env.batch_step(key_s, env_state, actions)
                 transition = Transition(last_obs, actions, rewards, dones, infos)
 
                 step_state = (params, env_state, obs, dones, hstate, rng, t+1)
@@ -333,7 +382,7 @@ def make_train(config, env):
                 )
 
                 # get the target q values of the greedy actions
-                valid_q_vals = jax.tree_util.tree_map(lambda q, valid_idx: q[..., valid_idx], q_vals, wrapped_env.valid_actions)
+                valid_q_vals = jax.tree_util.tree_map(lambda q, valid_idx: q[..., valid_idx], q_vals, env.valid_actions)
                 target_max_qvals = jax.tree_util.tree_map(
                     lambda t_q, q: q_of_action(t_q, jnp.argmax(q, axis=-1))[1:], # get the greedy actions and avoid first timestep
                     target_q_vals,
@@ -398,7 +447,7 @@ def make_train(config, env):
             # UPDATE THE VARIABLES AND RETURN
             # reset the environment
             rng, _rng = jax.random.split(rng)
-            init_obs, env_state = wrapped_env.batch_reset(_rng)
+            init_obs, env_state = env.batch_reset(_rng)
             init_dones = {agent:jnp.zeros((config["NUM_ENVS"]), dtype=bool) for agent in env.agents+['__all__']}
 
             # update the states
@@ -412,43 +461,8 @@ def make_train(config, env):
                 lambda _: target_agent_params,
                 operand=None
             )
-
-            # update the greedy rewards
-            rng, _rng = jax.random.split(rng)
-            test_metrics = jax.lax.cond(
-                time_state['updates'] % (config["TEST_INTERVAL"] // config["NUM_STEPS"] // config["NUM_ENVS"]) == 0,
-                lambda _: get_greedy_metrics(_rng, train_state.params, time_state),
-                lambda _: test_metrics,
-                operand=None
-            )
-
-            # update the returning metrics
-            metrics = {
-                'timesteps': time_state['timesteps']*config['NUM_ENVS'],
-                'updates' : time_state['updates'],
-                'loss': loss,
-                'rewards': jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0).mean(), traj_batch.rewards),
-            }
-            metrics['test_metrics'] = test_metrics # add the test metrics dictionary
-
-            if config.get('WANDB_ONLINE_REPORT', False):
-                def callback(metrics, infos):
-                    info_metrics = {
-                        k:v[...,0][infos["returned_episode"][..., 0]].mean()
-                        for k,v in infos.items() if k!="returned_episode"
-                    }
-                    wandb.log(
-                        {
-                            "returns": metrics['rewards']['__all__'].mean(),
-                            "timestep": metrics['timesteps'],
-                            "updates": metrics['updates'],
-                            "loss": metrics['loss'],
-                            **info_metrics,
-                            **{k:v.mean() for k, v in metrics['test_metrics'].items()}
-                        }
-                    )
-                jax.debug.callback(callback, metrics, traj_batch.infos)
-
+            metric = traj_batch.info
+            
             runner_state = (
                 train_state,
                 target_agent_params,
@@ -460,149 +474,49 @@ def make_train(config, env):
                 test_metrics,
                 rng
             )
+            return runner_state, metric
 
-            return runner_state, metrics
-
-        def get_greedy_metrics(rng, params, time_state):
-            """Help function to test greedy policy during training"""
-            def _greedy_env_step(step_state, unused):
-                params, env_state, last_obs, last_dones, hstate, rng = step_state
-                rng, key_s = jax.random.split(rng)
-                obs_   = {a:last_obs[a] for a in env.agents}
-                obs_   = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
-                dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
-                hstate, q_vals = homogeneous_pass(params, hstate, obs_, dones_)
-                actions = jax.tree_util.tree_map(lambda q, valid_idx: jnp.argmax(q.squeeze(0)[..., valid_idx], axis=-1), q_vals, test_env.valid_actions)
-                obs, env_state, rewards, dones, infos = test_env.batch_step(key_s, env_state, actions)
-                step_state = (params, env_state, obs, dones, hstate, rng)
-                return step_state, (rewards, dones, infos)
-            rng, _rng = jax.random.split(rng)
-            init_obs, env_state = test_env.batch_reset(_rng)
-            init_dones = {agent:jnp.zeros((config["NUM_TEST_EPISODES"]), dtype=bool) for agent in env.agents+['__all__']}
-            rng, _rng = jax.random.split(rng)
-            if config["PARAMETERS_SHARING"]:
-                hstate = ScannedRNN.initialize_carry(config['AGENT_HIDDEN_DIM'], len(env.agents)*config["NUM_TEST_EPISODES"]) # (n_agents*n_envs, hs_size)
-            else:
-                hstate = ScannedRNN.initialize_carry(config['AGENT_HIDDEN_DIM'], len(env.agents), config["NUM_TEST_EPISODES"]) # (n_agents, n_envs, hs_size)
-            step_state = (
-                params,
-                env_state,
-                init_obs,
-                init_dones,
-                hstate, 
-                _rng,
-            )
-            step_state, (rewards, dones, infos) = jax.lax.scan(
-                _greedy_env_step, step_state, None, config["NUM_STEPS"]
-            )
-            # compute the metrics of the first episode that is done for each parallel env
-            def first_episode_returns(rewards, dones):
-                first_done = jax.lax.select(jnp.argmax(dones)==0., dones.size, jnp.argmax(dones))
-                first_episode_mask = jnp.where(jnp.arange(dones.size) <= first_done, True, False)
-                return jnp.where(first_episode_mask, rewards, 0.).sum()
-            all_dones = dones['__all__']
-            first_returns = jax.tree_util.tree_map(lambda r: jax.vmap(first_episode_returns, in_axes=1)(r, all_dones), rewards)
-            first_infos   = jax.tree_util.tree_map(lambda i: jax.vmap(first_episode_returns, in_axes=1)(i[..., 0], all_dones), infos)
-            metrics = {
-                'test_returns': first_returns['__all__'],# episode returns
-                **{'test_'+k:v for k,v in first_infos.items()}
-            }
-            if config.get('VERBOSE', False):
-                def callback(timestep, val):
-                    print(f"Timestep: {timestep}, return: {val}")
-                jax.debug.callback(callback, time_state['timesteps']*config['NUM_ENVS'], first_returns['__all__'].mean())
-            return metrics
-
-        time_state = {
-            'timesteps':jnp.array(0),
-            'updates':  jnp.array(0)
-        }
         rng, _rng = jax.random.split(rng)
-        test_metrics = get_greedy_metrics(_rng, train_state.params, time_state) # initial greedy metrics
-        
-        # train
-        rng, _rng = jax.random.split(rng)
-        runner_state = (
-            train_state,
-            target_agent_params,
-            env_state,
-            buffer_state,
-            time_state,
-            init_obs,
-            init_dones,
-            test_metrics,
-            _rng
-        )
-        runner_state, metrics = jax.lax.scan(
+        runner_state = (train_state, env_state, obsv, _rng)
+        runner_state, metric = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
-        return {'runner_state':runner_state, 'metrics':metrics}
-    
+        return {"runner_state": runner_state, "metrics": metric}
+
     return train
 
-@hydra.main(version_base=None, config_path="./config", config_name="config")
+
+
+@hydra.main(version_base=None, config_path="config", config_name="vdn_overcooked")
 def main(config):
-    config = OmegaConf.to_container(config)
-
-    print('Config:\n', OmegaConf.to_yaml(config))
-
-    env_name = config["env"]["ENV_NAME"]
-    alg_name = f'vdn_{"ps" if config["alg"].get("PARAMETERS_SHARING", True) else "ns"}'
+    config = OmegaConf.to_container(config) 
+    config["ENV_KWARGS"]["layout"] = overcooked_layouts[config["ENV_KWARGS"]["layout"]]
+    rng = jax.random.PRNGKey(30)
+    num_seeds = 20
+    with jax.disable_jit(False):
+        train_jit = jax.jit(jax.vmap(make_train(config)))
+        rngs = jax.random.split(rng, num_seeds)
+        out = train_jit(rngs)
     
-    # smac init neeeds a scenario
-    if 'smax' in env_name.lower():
-        config['env']['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['env']['MAP_NAME'])
-        env_name = f"{config['env']['ENV_NAME']}_{config['env']['MAP_NAME']}"
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = SMAXLogWrapper(env)
-    # overcooked needs a layout 
-    elif 'overcooked' in env_name.lower():
-        config['env']["ENV_KWARGS"]["layout"] = overcooked_layouts[config['env']["ENV_KWARGS"]["layout"]]
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = LogWrapper(env)
-    else:
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = LogWrapper(env)
-
-    #config["alg"]["NUM_STEPS"] = config["alg"].get("NUM_STEPS", env.max_steps) # default steps defined by the env
+    print('** Saving Results **')
+    filename = f'{config["ENV_NAME"]}_cramped_room_new'
+    rewards = out["metrics"]["returned_episode_returns"].mean(-1).reshape((num_seeds, -1))
+    reward_mean = rewards.mean(0)  # mean 
+    reward_std = rewards.std(0) / np.sqrt(num_seeds)  # standard error
     
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=[
-            alg_name.upper(),
-            env_name.upper(),
-            "RNN",
-            "TD_LOSS" if config["alg"].get("TD_LAMBDA_LOSS", True) else "DQN_LOSS",
-            f"jax_{jax.__version__}",
-        ],
-        name=f'{alg_name}_{env_name}',
-        config=config,
-        mode=config["WANDB_MODE"],
-    )
-    
-    rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config["alg"], env)))
-    outs = jax.block_until_ready(train_vjit(rngs))
-    
-    # save params
-    if config['SAVE_PATH'] is not None:
+    plt.plot(reward_mean)
+    plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
+    # compute standard error
+    plt.xlabel("Update Step")
+    plt.ylabel("Return")
+    plt.savefig(f'{filename}.png')
 
-        def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:
-            flattened_dict = flatten_dict(params, sep=',')
-            save_file(flattened_dict, filename)
-
-        model_state = outs['runner_state'][0]
-        params = jax.tree_util.tree_map(lambda x: x[0], model_state.params) # save only params of the firt run
-        save_dir = os.path.join(config['SAVE_PATH'], env_name)
-        os.makedirs(save_dir, exist_ok=True)
-        save_params(params, f'{save_dir}/{alg_name}.safetensors')
-        print(f'Parameters of first batch saved in {save_dir}/{alg_name}.safetensors')
-        
-    plot_rewards(outs["metrics"], f'{env_name}_vdn', config["NUM_SEEDS"])
-
+    # animate first seed
+    train_state = jax.tree_util.tree_map(lambda x: x[0], out["runner_state"][0])
+    state_seq = get_rollout(train_state, config)
+    viz = OvercookedVisualizer()
+    # agent_view_size is hardcoded as it determines the padding around the layout.
+    viz.animate(state_seq, agent_view_size=5, filename=f"{filename}.gif")
 
 if __name__ == "__main__":
     main()
-    

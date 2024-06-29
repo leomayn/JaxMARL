@@ -24,6 +24,8 @@ from functools import partial
 from typing import NamedTuple, Dict, Union
 
 import chex
+from flax.struct import PyTreeNode
+from typing import Any
 
 import optax
 import flax.linen as nn
@@ -41,6 +43,10 @@ from jaxmarl.wrappers.baselines import LogWrapper, SMAXLogWrapper, CTRolloutMana
 from jaxmarl.environments.smax import map_name_to_scenario
 from jaxmarl.environments.overcooked import overcooked_layouts
 import matplotlib.pyplot as plt
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
+
+from safetensors.flax import load_file
+from flax.traverse_util import unflatten_dict
 
 class ScannedRNN(nn.Module):
 
@@ -91,6 +97,68 @@ class AgentRNN(nn.Module):
         q_vals = nn.Dense(self.action_dim, kernel_init=orthogonal(self.init_scale), bias_init=constant(0.0))(embedding)
 
         return hidden, q_vals
+    
+def plot_rewards(metrics, filename, num_seeds):
+    test_metrics = metrics["test_metrics"]
+    test_returns = test_metrics["test_returns"].mean(-1).reshape((num_seeds, -1))
+
+    reward_mean = test_returns.mean(0)  # mean
+    reward_std = test_returns.std(0) / np.sqrt(num_seeds)  # standard error
+    
+    plt.plot(reward_mean)
+    plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
+    plt.xlabel("Update Step")
+    plt.ylabel("Return")
+    plt.savefig(f'{filename}.png')
+
+def get_rollout(train_state, config):
+    env = make(config["env"]["ENV_NAME"], **config["env"]["ENV_KWARGS"])
+    env = CTRolloutManager(env, batch_size=1)
+    
+    network = AgentRNN(action_dim=env.max_action_space, hidden_dim=config["alg"]["AGENT_HIDDEN_DIM"], init_scale=config["alg"]['AGENT_INIT_SCALE'])
+    
+    key = jax.random.PRNGKey(0)
+    key, key_r, key_a = jax.random.split(key, 3)
+
+    obs, state = env.wrapped_reset(key_r)
+    state_seq = [state]
+    
+    hidden_state = ScannedRNN.initialize_carry(config['alg']['AGENT_HIDDEN_DIM'], 1)
+    network_params = train_state.params
+
+    done = False
+
+    while not done:
+        key, key_s = jax.random.split(key, 2)
+        
+        # Ensure observations are flattened and combined correctly
+        obs = {k: v.flatten() for k, v in obs.items()}
+        combined_obs = jnp.stack([obs[agent] for agent in env.agents])
+        
+        # Initialize dones to zeros
+        dones = {agent: jnp.zeros((1,), dtype=bool) for agent in env.agents}
+        combined_dones = jnp.stack([dones[agent] for agent in env.agents])
+        
+        # Combine observations and dones for RNN input
+        rnn_input = (combined_obs, combined_dones)
+        hidden_state, q_vals = network.apply(network_params, hidden_state, rnn_input)
+        
+        # Select actions based on q-values
+        actions = jnp.argmax(q_vals, axis=-1)
+        actions_dict = {agent: int(actions[i].item()) for i, agent in enumerate(env.agents)}
+        
+        # Step the environment
+        obs, state, rewards, dones, infos = env.wrapped_step(key_s, state, actions_dict)
+        
+        # Check if the episode is done
+        done = dones['__all__']
+        state_seq.append(state)
+    return state_seq
+
+
+
+
+
 
 
 class EpsilonGreedy:
@@ -130,18 +198,15 @@ class Transition(NamedTuple):
     dones: dict
     infos: dict
     
-def plot_rewards(metrics, filename, num_seeds):
-    test_metrics = metrics["test_metrics"]
-    test_returns = test_metrics["test_returns"].mean(-1).reshape((num_seeds, -1))
-
-    reward_mean = test_returns.mean(0)  # mean
-    reward_std = test_returns.std(0) / np.sqrt(num_seeds)  # standard error
+class ModelState(PyTreeNode):
+    params: Any
     
-    plt.plot(reward_mean)
-    plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
-    plt.xlabel("Update Step")
-    plt.ylabel("Return")
-    plt.savefig(f'{filename}.png')
+def load_params(filepath: str):
+    # Load flattened parameters from the safetensors file
+    flat_params = load_file(filepath)
+    # Unflatten the parameters to the original tree structure
+    params = unflatten_dict({tuple(k.split(',')): v for k, v in flat_params.items()})
+    return params
 
 
 def make_train(config, env):
@@ -540,22 +605,77 @@ def make_train(config, env):
     
     return train
 
+def tune(default_config):
+    """Hyperparameter sweep with wandb."""
+    import copy
+
+    default_config = OmegaConf.to_container(default_config)
+
+    print('Config:\n', OmegaConf.to_yaml(default_config))
+
+    def wrapped_make_train():
+
+        wandb.init(project=default_config['PROJECT'])
+        # update the default params
+        config = copy.deepcopy(default_config)
+        for k, v in dict(wandb.config).items():
+            config['alg'][k] = v
+            
+        print('running experiment with params:', config)
+        
+        env_name = config["env"]["ENV_NAME"]
+        # smac init neeeds a scenario
+        if 'smax' in env_name.lower():
+            config['env']['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['env']['MAP_NAME'])
+            env_name = f"{config['env']['ENV_NAME']}_{config['env']['MAP_NAME']}"
+            env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
+            env = SMAXLogWrapper(env)
+        # overcooked needs a layout 
+        elif 'overcooked' in env_name.lower():
+            config['env']["ENV_KWARGS"]["layout"] = overcooked_layouts[config['env']["ENV_KWARGS"]["layout"]]
+            env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
+            env = LogWrapper(env)
+        else:
+            env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
+            env = LogWrapper(env)
+
+        rng = jax.random.PRNGKey(config["SEED"])
+        rngs = jax.random.split(rng, config["NUM_SEEDS"])
+        train_vjit = jax.jit(jax.vmap(make_train(config["alg"], env)))
+        outs = jax.block_until_ready(train_vjit(rngs))
+
+    sweep_config = {
+        'method': 'bayes',
+        'metric': {
+            'name': 'test_returns',
+            'goal': 'maximize',
+        },
+        'parameters':{
+            'LR':{'values':[0.005, 0.001, 0.0005]},
+            'EPS_ADAM':{'values':[0.0001, 0.0000001, 0.0000000001]},
+            'SCALE_INPUTS':{'values':[True, False]},
+            'NUM_ENVS':{'values':[8, 16]},
+            'N_MINI_UPDATES':{'values':[1, 2, 4]},
+        },
+    }
+
+    wandb.login()
+    sweep_id = wandb.sweep(sweep_config, entity=default_config['ENTITY'],project=default_config['PROJECT'])
+    wandb.agent(sweep_id, wrapped_make_train, count=100)
+
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
+    # tune(config)
     config = OmegaConf.to_container(config)
-
-    print('Config:\n', OmegaConf.to_yaml(config))
 
     env_name = config["env"]["ENV_NAME"]
     alg_name = f'vdn_{"ps" if config["alg"].get("PARAMETERS_SHARING", True) else "ns"}'
     
-    # smac init neeeds a scenario
     if 'smax' in env_name.lower():
         config['env']['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['env']['MAP_NAME'])
         env_name = f"{config['env']['ENV_NAME']}_{config['env']['MAP_NAME']}"
         env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
         env = SMAXLogWrapper(env)
-    # overcooked needs a layout 
     elif 'overcooked' in env_name.lower():
         config['env']["ENV_KWARGS"]["layout"] = overcooked_layouts[config['env']["ENV_KWARGS"]["layout"]]
         env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
@@ -564,8 +684,6 @@ def main(config):
         env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
         env = LogWrapper(env)
 
-    #config["alg"]["NUM_STEPS"] = config["alg"].get("NUM_STEPS", env.max_steps) # default steps defined by the env
-    
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -580,29 +698,52 @@ def main(config):
         config=config,
         mode=config["WANDB_MODE"],
     )
-    
+
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
+    
+    
     train_vjit = jax.jit(jax.vmap(make_train(config["alg"], env)))
     outs = jax.block_until_ready(train_vjit(rngs))
-    
-    # save params
-    if config['SAVE_PATH'] is not None:
 
+    # Save params
+    
+    if config['SAVE_PATH'] is not None:
         def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:
             flattened_dict = flatten_dict(params, sep=',')
             save_file(flattened_dict, filename)
 
         model_state = outs['runner_state'][0]
-        params = jax.tree_util.tree_map(lambda x: x[0], model_state.params) # save only params of the firt run
+        params = jax.tree_util.tree_map(lambda x: x[0], model_state.params) 
         save_dir = os.path.join(config['SAVE_PATH'], env_name)
         os.makedirs(save_dir, exist_ok=True)
         save_params(params, f'{save_dir}/{alg_name}.safetensors')
         print(f'Parameters of first batch saved in {save_dir}/{alg_name}.safetensors')
-        
+    
+    # Plotting
     plot_rewards(outs["metrics"], f'{env_name}_vdn', config["NUM_SEEDS"])
+    
+    # Debugging step
+    train_state = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0])
+    
+    '''
+    # loading params
+    # Path to the safetensors file
+    save_dir = os.path.join(config['SAVE_PATH'], env_name)
+    safetensors_file = f'{save_dir}/{alg_name}.safetensors'
+    
+    # Load parameters
+    print(f"Loading parameters from {safetensors_file}")
+    params = load_params(safetensors_file)
+    
+    train_state = ModelState(params=params)
+    '''
+    
 
+    state_seq = get_rollout(train_state, config)
+    viz = OvercookedVisualizer()
+    viz.animate(state_seq, agent_view_size=5, filename=f'{config["env"]["ENV_NAME"]}_vdn.gif')
 
 if __name__ == "__main__":
     main()
-    
+

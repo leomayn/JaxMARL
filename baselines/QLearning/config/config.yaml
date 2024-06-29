@@ -1,6 +1,6 @@
 # experiment params
-"NUM_SEEDS": 2
-"SEED": 0
+"NUM_SEEDS": 20
+"SEED": 30
 
 # wandb params
 "ENTITY": ""

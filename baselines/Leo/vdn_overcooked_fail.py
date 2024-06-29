@@ -40,6 +40,8 @@ from jaxmarl import make
 from jaxmarl.wrappers.baselines import LogWrapper, SMAXLogWrapper, CTRolloutManager
 from jaxmarl.environments.smax import map_name_to_scenario
 from jaxmarl.environments.overcooked import overcooked_layouts
+
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 import matplotlib.pyplot as plt
 
 class ScannedRNN(nn.Module):
@@ -130,32 +132,78 @@ class Transition(NamedTuple):
     dones: dict
     infos: dict
     
-def plot_rewards(metrics, filename, num_seeds):
-    test_metrics = metrics["test_metrics"]
-    test_returns = test_metrics["test_returns"].mean(-1).reshape((num_seeds, -1))
 
-    reward_mean = test_returns.mean(0)  # mean
-    reward_std = test_returns.std(0) / np.sqrt(num_seeds)  # standard error
+def get_rollout(train_state, config):
+    env = make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    wrapped_env = LogWrapper(CTRolloutManager(env, batch_size=1))
+
+    network = AgentRNN(
+        action_dim=wrapped_env.max_action_space,
+        hidden_dim=config["AGENT_HIDDEN_DIM"],
+        init_scale=config['AGENT_INIT_SCALE']
+    )
+
+    key = jax.random.PRNGKey(0)
+    key, key_r, key_a = jax.random.split(key, 3)
+
+    init_obs, env_state = wrapped_env.batch_reset(key_r)
+    init_obs = {k: v.flatten() for k, v in init_obs.items()}
+
+    network_params = train_state.params
+    hstate = ScannedRNN.initialize_carry(config['AGENT_HIDDEN_DIM'], 1)
+
+    done = False
+    state_seq = [env_state]
+
+    while not done:
+        key, key_a0, key_a1, key_s = jax.random.split(key, 4)
+
+        obs = {k: v.flatten() for k, v in init_obs.items()}
+
+        obs_agent_0 = obs["agent_0"].reshape(1, -1)
+        obs_agent_1 = obs["agent_1"].reshape(1, -1)
+        dones = jnp.array([done]).reshape(1, -1)
+
+        hidden_state, q_vals = network.apply(network_params, hstate, (obs_agent_0, dones))
+        pi_0 = q_vals.argmax(axis=-1)
+
+        hidden_state, q_vals = network.apply(network_params, hstate, (obs_agent_1, dones))
+        pi_1 = q_vals.argmax(axis=-1)
+
+        actions = {"agent_0": pi_0[0], "agent_1": pi_1[0]}
+
+        obs, env_state, reward, done, info = wrapped_env.batch_step(key_s, env_state, actions)
+        done = done["__all__"]
+        state_seq.append(env_state)
+
+    print(f"Generated state sequence, number of frames: {len(state_seq)}")
     
-    plt.plot(reward_mean)
-    plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
-    plt.xlabel("Update Step")
-    plt.ylabel("Return")
-    plt.savefig(f'{filename}.png')
+    if not state_seq:
+        raise ValueError("State sequence is empty. Ensure get_rollout generates valid states.")
+    
+    for i, state in enumerate(state_seq):
+        print(f"Frame {i}: {state}")
+
+    return state_seq
 
 
-def make_train(config, env):
 
+        
+
+def make_train(config):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     
+    
     def train(rng):
 
         # INIT ENV
-        rng, _rng = jax.random.split(rng)
+        env = make(config["ENV_NAME"], **config["ENV_KWARGS"])
+        env = LogWrapper(env)
         wrapped_env = CTRolloutManager(env, batch_size=config["NUM_ENVS"])
         test_env = CTRolloutManager(env, batch_size=config["NUM_TEST_EPISODES"]) # batched env for testing (has different batch size)
+        rng, _rng = jax.random.split(rng)
         init_obs, env_state = wrapped_env.batch_reset(_rng)
         init_dones = {agent:jnp.zeros((config["NUM_ENVS"]), dtype=bool) for agent in env.agents+['__all__']}
 
@@ -429,6 +477,11 @@ def make_train(config, env):
                 'loss': loss,
                 'rewards': jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0).mean(), traj_batch.rewards),
             }
+            rewards_sum = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), traj_batch.rewards)
+            episode_returns_vdn = jnp.sum(jnp.stack(list(rewards_sum.values())), axis=0)
+
+            # Store the episode returns in the metrics dictionary
+            metrics['episode_returns'] = episode_returns_vdn
             metrics['test_metrics'] = test_metrics # add the test metrics dictionary
 
             if config.get('WANDB_ONLINE_REPORT', False):
@@ -540,31 +593,19 @@ def make_train(config, env):
     
     return train
 
-@hydra.main(version_base=None, config_path="./config", config_name="config")
+@hydra.main(version_base=None, config_path="./config", config_name="vdn_overcooked")
 def main(config):
     config = OmegaConf.to_container(config)
 
-    print('Config:\n', OmegaConf.to_yaml(config))
+    # print('Config:\n', OmegaConf.to_yaml(config))
 
-    env_name = config["env"]["ENV_NAME"]
-    alg_name = f'vdn_{"ps" if config["alg"].get("PARAMETERS_SHARING", True) else "ns"}'
+    env_name = config["ENV_NAME"]
+    alg_name = f'vdn_{"ps" if config.get("PARAMETERS_SHARING", True) else "ns"}'
     
-    # smac init neeeds a scenario
-    if 'smax' in env_name.lower():
-        config['env']['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['env']['MAP_NAME'])
-        env_name = f"{config['env']['ENV_NAME']}_{config['env']['MAP_NAME']}"
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = SMAXLogWrapper(env)
-    # overcooked needs a layout 
-    elif 'overcooked' in env_name.lower():
-        config['env']["ENV_KWARGS"]["layout"] = overcooked_layouts[config['env']["ENV_KWARGS"]["layout"]]
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = LogWrapper(env)
-    else:
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = LogWrapper(env)
 
-    #config["alg"]["NUM_STEPS"] = config["alg"].get("NUM_STEPS", env.max_steps) # default steps defined by the env
+    config["ENV_KWARGS"]["layout"] = overcooked_layouts[config["ENV_KWARGS"]["layout"]]
+
+    #config["NUM_STEPS"] = config.get("NUM_STEPS", env.max_steps) # default steps defined by the env
     
     wandb.init(
         entity=config["ENTITY"],
@@ -573,7 +614,7 @@ def main(config):
             alg_name.upper(),
             env_name.upper(),
             "RNN",
-            "TD_LOSS" if config["alg"].get("TD_LAMBDA_LOSS", True) else "DQN_LOSS",
+            "TD_LOSS" if config.get("TD_LAMBDA_LOSS", True) else "DQN_LOSS",
             f"jax_{jax.__version__}",
         ],
         name=f'{alg_name}_{env_name}',
@@ -583,8 +624,9 @@ def main(config):
     
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = jax.jit(jax.vmap(make_train(config["alg"], env)))
+    train_vjit = jax.jit(jax.vmap(make_train(config)))
     outs = jax.block_until_ready(train_vjit(rngs))
+    num_seeds = config["NUM_SEEDS"]
     
     # save params
     if config['SAVE_PATH'] is not None:
@@ -600,9 +642,30 @@ def main(config):
         save_params(params, f'{save_dir}/{alg_name}.safetensors')
         print(f'Parameters of first batch saved in {save_dir}/{alg_name}.safetensors')
         
-    plot_rewards(outs["metrics"], f'{env_name}_vdn', config["NUM_SEEDS"])
+    print('** Saving Results **')
 
+    # Now use the correct key to access rewards
+    rewards = outs["metrics"]["episode_returns"].mean(-1).reshape((num_seeds, -1))
+    filename = f'{config["ENV_NAME"]}_cramped_room_new'
+    reward_mean = rewards.mean(0)  # mean 
+    reward_std = rewards.std(0) / np.sqrt(num_seeds)  # standard error
+    
+    plt.plot(reward_mean)
+    plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
+    # compute standard error
+    plt.xlabel("Update Step")
+    plt.ylabel("Return")
+    plt.savefig(f'{filename}.png')
+
+    # animate first seed
+    train_state = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0])
+    state_seq = get_rollout(train_state, config)
+
+    if not state_seq:
+        raise ValueError("State sequence is empty. Ensure get_rollout generates valid states.")
+
+    viz = OvercookedVisualizer()
+    viz.animate(state_seq, agent_view_size=5, filename=f"{filename}.gif")
 
 if __name__ == "__main__":
     main()
-    
