@@ -17,16 +17,12 @@ The implementation closely follows the original Pymarl: https://github.com/oxwhi
 """
 
 import os
-import time
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
 import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
 from typing import NamedTuple, Dict, Union
-
-# jax.config.update("jax_enable_x64", True)
-
 
 import chex
 from flax.struct import PyTreeNode
@@ -52,8 +48,6 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 
 from safetensors.flax import load_file
 from flax.traverse_util import unflatten_dict
-
-update_durations = []
 
 class ScannedRNN(nn.Module):
 
@@ -119,10 +113,10 @@ def plot_rewards(metrics, filename, num_seeds):
     plt.savefig(f'{filename}.png')
 
 def get_rollout(train_state, config):
-    env = make(config["env"]["ENV_NAME"], **config["env"]["ENV_KWARGS"])
+    env = make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = CTRolloutManager(env, batch_size=1)
     
-    network = AgentRNN(action_dim=env.max_action_space, hidden_dim=config["alg"]["AGENT_HIDDEN_DIM"], init_scale=config["alg"]['AGENT_INIT_SCALE'])
+    network = AgentRNN(action_dim=env.max_action_space, hidden_dim=config["AGENT_HIDDEN_DIM"], init_scale=config['AGENT_INIT_SCALE'])
     
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
@@ -130,7 +124,7 @@ def get_rollout(train_state, config):
     obs, state = env.wrapped_reset(key_r)
     state_seq = [state]
     
-    hidden_state = ScannedRNN.initialize_carry(config['alg']['AGENT_HIDDEN_DIM'], 1)
+    hidden_state = ScannedRNN.initialize_carry(config['AGENT_HIDDEN_DIM'], 1)
     network_params = train_state.params
 
     done = False
@@ -205,6 +199,8 @@ class Transition(NamedTuple):
     dones: dict
     infos: dict
     
+class ModelState(PyTreeNode):
+    params: Any
     
 def load_params(filepath: str):
     # Load flattened parameters from the safetensors file
@@ -326,6 +322,7 @@ def make_train(config, env):
         def _update_step(runner_state, unused):
 
             train_state, target_agent_params, env_state, buffer_state, time_state, init_obs, init_dones, test_metrics, rng = runner_state
+
             # EPISODE STEP
             def _env_step(step_state, unused):
 
@@ -462,7 +459,6 @@ def make_train(config, env):
             grad_fn = jax.value_and_grad(_loss_fn, has_aux=False)
             loss, grads = grad_fn(train_state.params, target_agent_params, init_hs, learn_traj)
             train_state = train_state.apply_gradients(grads=grads)
-            
 
 
             # UPDATE THE VARIABLES AND RETURN
@@ -606,7 +602,7 @@ def make_train(config, env):
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state, "metrics": metrics}
+        return {'runner_state':runner_state, 'metrics':metrics}
     
     return train
 
@@ -624,29 +620,29 @@ def tune(default_config):
         # update the default params
         config = copy.deepcopy(default_config)
         for k, v in dict(wandb.config).items():
-            config['alg'][k] = v
+            config[k] = v
             
         print('running experiment with params:', config)
         
-        env_name = config["env"]["ENV_NAME"]
+        env_name = config["ENV_NAME"]
         # smac init neeeds a scenario
         if 'smax' in env_name.lower():
-            config['env']['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['env']['MAP_NAME'])
-            env_name = f"{config['env']['ENV_NAME']}_{config['env']['MAP_NAME']}"
-            env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
+            config['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['MAP_NAME'])
+            env_name = f"{config['ENV_NAME']}_{config['MAP_NAME']}"
+            env = make(config["ENV_NAME"], **config['ENV_KWARGS'])
             env = SMAXLogWrapper(env)
         # overcooked needs a layout 
         elif 'overcooked' in env_name.lower():
-            config['env']["ENV_KWARGS"]["layout"] = overcooked_layouts[config['env']["ENV_KWARGS"]["layout"]]
-            env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
+            config["ENV_KWARGS"]["layout"] = overcooked_layouts[config["ENV_KWARGS"]["layout"]]
+            env = make(config["ENV_NAME"], **config['ENV_KWARGS'])
             env = LogWrapper(env)
         else:
-            env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
+            env = make(config["ENV_NAME"], **config['ENV_KWARGS'])
             env = LogWrapper(env)
 
         rng = jax.random.PRNGKey(config["SEED"])
         rngs = jax.random.split(rng, config["NUM_SEEDS"])
-        train_vjit = jax.jit(jax.vmap(make_train(config["alg"], env)))
+        train_vjit = jax.jit(jax.vmap(make_train(config, env)))
         outs = jax.block_until_ready(train_vjit(rngs))
 
     sweep_config = {
@@ -655,52 +651,14 @@ def tune(default_config):
             'name': 'test_returns',
             'goal': 'maximize',
         },
-        'parameters': {
-            'LR': {
-                'values': [0.00005, 0.0001, 0.0005, 0.001],
-            },
-            'EPS_ADAM': {
-                'values': [0.0000001, 0.000001, 0.00001],
-            },
-            'MIXER_EMBEDDING_DIM': {
-                'values': [32, 64, 128],
-            },
-            'MIXER_HYPERNET_HIDDEN_DIM': {
-                'values': [64, 128, 256],
-            },
-            'MIXER_INIT_SCALE': {
-                'values': [0.00001, 0.0001, 0.001],
-            },
-            'EPSILON_START': {
-                'values': [0.8, 0.9, 1.0, 1.1],
-            },
-            'EPSILON_FINISH': {
-                'values': [0.01, 0.05, 0.1],
-            },
-            'EPSILON_ANNEAL_TIME': {
-                'values': [0.5e6, 1e6, 2e6, 5e6],
-            },
-            'AGENT_HIDDEN_DIM': {
-                'values': [64, 128, 256],
-            },
-            'AGENT_INIT_SCALE': {
-                'values': [1.0, 2.0, 3.0],
-            },
-            'MAX_GRAD_NORM': {
-                'values': [5, 10, 20],
-            },
-            'TARGET_UPDATE_INTERVAL': {
-                'values': [100, 200, 400],
-            },
-            'WEIGHT_DECAY_ADAM': {
-                'values': [0.000001, 0.00001, 0.0001],
-            },
+        'parameters':{
+            'LR':{'values':[0.005, 0.001, 0.0005]},
+            'EPS_ADAM':{'values':[0.0001, 0.0000001, 0.0000000001]},
+            'SCALE_INPUTS':{'values':[True, False]},
+            'NUM_ENVS':{'values':[8, 16]},
+            'N_MINI_UPDATES':{'values':[1, 2, 4]},
         },
     }
-
-
-
-
 
     wandb.login()
     sweep_id = wandb.sweep(sweep_config, entity=default_config['ENTITY'],project=default_config['PROJECT'])
@@ -710,22 +668,13 @@ def tune(default_config):
 def main(config):
     # tune(config)
     config = OmegaConf.to_container(config)
-
-    env_name = config["env"]["ENV_NAME"]
-    alg_name = f'vdn_{"ps" if config["alg"].get("PARAMETERS_SHARING", True) else "ns"}'
     
-    if 'smax' in env_name.lower():
-        config['env']['ENV_KWARGS']['scenario'] = map_name_to_scenario(config['env']['MAP_NAME'])
-        env_name = f"{config['env']['ENV_NAME']}_{config['env']['MAP_NAME']}"
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = SMAXLogWrapper(env)
-    elif 'overcooked' in env_name.lower():
-        config['env']["ENV_KWARGS"]["layout"] = overcooked_layouts[config['env']["ENV_KWARGS"]["layout"]]
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = LogWrapper(env)
-    else:
-        env = make(config["env"]["ENV_NAME"], **config['env']['ENV_KWARGS'])
-        env = LogWrapper(env)
+    env_name = config["ENV_NAME"]
+    alg_name = f'vdn_{"ps" if config.get("PARAMETERS_SHARING", True) else "ns"}'
+    
+    config["ENV_KWARGS"]["layout"] = overcooked_layouts[config["ENV_KWARGS"]["layout"]]
+    env = make(config["ENV_NAME"], **config['ENV_KWARGS'])
+    env = LogWrapper(env)
 
     wandb.init(
         entity=config["ENTITY"],
@@ -734,7 +683,7 @@ def main(config):
             alg_name.upper(),
             env_name.upper(),
             "RNN",
-            "TD_LOSS" if config["alg"].get("TD_LAMBDA_LOSS", True) else "DQN_LOSS",
+            "TD_LOSS" if config.get("TD_LAMBDA_LOSS", True) else "DQN_LOSS",
             f"jax_{jax.__version__}",
         ],
         name=f'{alg_name}_{env_name}',
@@ -745,13 +694,9 @@ def main(config):
     rng = jax.random.PRNGKey(config["SEED"])
     rngs = jax.random.split(rng, config["NUM_SEEDS"])
     
-    train_vjit = jax.jit(jax.vmap(make_train(config["alg"], env)))
     
-    start_time = time.time()
+    train_vjit = jax.jit(jax.vmap(make_train(config, env)))
     outs = jax.block_until_ready(train_vjit(rngs))
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"Time for training: {total_time:.2f}")
 
     # Save params
     
@@ -771,7 +716,7 @@ def main(config):
     plot_rewards(outs["metrics"], f'{env_name}_vdn', config["NUM_SEEDS"])
     
     # Debugging step
-    # train_state = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0])
+    train_state = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0])
     
     '''
     # loading params
@@ -786,11 +731,10 @@ def main(config):
     train_state = ModelState(params=params)
     '''
     
-    '''
+
     state_seq = get_rollout(train_state, config)
     viz = OvercookedVisualizer()
-    viz.animate(state_seq, agent_view_size=5, filename=f'{config["env"]["ENV_NAME"]}_vdn.gif')
-    '''
+    viz.animate(state_seq, agent_view_size=5, filename=f'{config["ENV_NAME"]}_vdn.gif')
 
 if __name__ == "__main__":
     main()

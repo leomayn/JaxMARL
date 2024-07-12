@@ -1,9 +1,9 @@
-""" 
+"""
 Based on PureJaxRL Implementation of PPO
 """
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import time
 import jax
 import jax.numpy as jnp
@@ -23,8 +23,6 @@ import hydra
 from omegaconf import OmegaConf
 
 import matplotlib.pyplot as plt
-
-update_durations = []
 
 class ActorCritic(nn.Module):
     action_dim: Sequence[int]
@@ -72,6 +70,7 @@ class Transition(NamedTuple):
     log_prob: jnp.ndarray
     obs: jnp.ndarray
     info: jnp.ndarray
+
 def plot_update_durations(durations, filename):
     plt.figure()
     plt.plot(durations)
@@ -82,9 +81,6 @@ def plot_update_durations(durations, filename):
 
 def get_rollout(train_state, config):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    # env_params = env.default_params
-    # env = LogWrapper(env)
-
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
     key = jax.random.PRNGKey(0)
     key, key_r, key_a = jax.random.split(key, 3)
@@ -102,18 +98,13 @@ def get_rollout(train_state, config):
     while not done:
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
 
-        # obs_batch = batchify(obs, env.agents, config["NUM_ACTORS"])
-        # breakpoint()
         obs = {k: v.flatten() for k, v in obs.items()}
 
         pi_0, _ = network.apply(network_params, obs["agent_0"])
         pi_1, _ = network.apply(network_params, obs["agent_1"])
 
         actions = {"agent_0": pi_0.sample(seed=key_a0), "agent_1": pi_1.sample(seed=key_a1)}
-        # env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-        # env_act = {k: v.flatten() for k, v in env_act.items()}
 
-        # STEP ENV
         obs, state, reward, done, info = env.step(key_s, state, actions)
         done = done["__all__"]
 
@@ -124,7 +115,6 @@ def get_rollout(train_state, config):
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
-
 
 def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     x = x.reshape((num_actors, num_envs, -1))
@@ -336,21 +326,19 @@ def make_train(config):
             
             end_time = time.time()
             update_duration = end_time - start_time
-            update_durations.append(update_duration)
             
             runner_state = (train_state, env_state, last_obs, rng)
-            return runner_state, metric
+            return runner_state, (metric, update_duration)
 
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, _rng)
-        runner_state, metric = jax.lax.scan(
+        results = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
         )
-        return {"runner_state": runner_state, "metrics": metric}
+        runner_state, (metrics, update_durations) = results
+        return {"runner_state": runner_state, "metrics": metrics, "update_durations": update_durations}
 
     return train
-
-
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_ff_overcooked")
 def main(config):
@@ -361,11 +349,7 @@ def main(config):
     with jax.disable_jit(False):
         train_jit = jax.jit(jax.vmap(make_train(config)))
         rngs = jax.random.split(rng, num_seeds)
-        start_time = time.time()
         out = train_jit(rngs)
-        end_time = time.time()
-        total_time = end_time - start_time
-        print(f"Time for training: {total_time:.2f}")
     
     print('** Saving Results **')
     filename = f'{config["ENV_NAME"]}_cramped_room_new'
@@ -373,17 +357,13 @@ def main(config):
     reward_mean = rewards.mean(0)  # mean 
     reward_std = rewards.std(0) / np.sqrt(num_seeds)  # standard error
     
-    print(len(rewards))
-    print(len(reward_mean))
-    
     plt.plot(reward_mean)
     plt.fill_between(range(len(reward_mean)), reward_mean - reward_std, reward_mean + reward_std, alpha=0.2)
-    # compute standard error
     plt.xlabel("Update Step")
     plt.ylabel("Return")
     plt.savefig(f'{filename}.png')
     
-    plot_update_durations(update_durations, 'training')
+    plot_update_durations(out["update_durations"], 'training')
 
     # animate first seed
     train_state = jax.tree_util.tree_map(lambda x: x[0], out["runner_state"][0])

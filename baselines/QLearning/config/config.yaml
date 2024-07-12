@@ -1,10 +1,10 @@
 # experiment params
-"NUM_SEEDS": 20
+"NUM_SEEDS": 15
 "SEED": 30
 
 # wandb params
 "ENTITY": ""
-"PROJECT": ""
+"PROJECT": "VDN4"
 "WANDB_MODE": "disabled"
 
 # where to save the params (if None, will not save)
